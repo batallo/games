@@ -77,7 +77,8 @@
     /* mirrors #pad-back: same offset and text line (padding = button border + padding) */
     #pad-score { position: absolute; top: 12px; right: 12px; padding: 7px 13px; pointer-events: none; font-size: 14px; }
     #pad-back { position: absolute; top: 12px; left: 12px; }
-    #pad-restart { position: absolute; top: 12px; left: 50%; transform: translateX(-50%); }
+    /* the gear glyph renders small: bigger font, less padding, same height as Back */
+    #pad-menu-open { position: absolute; top: 12px; left: 50%; transform: translateX(-50%); font-size: 18px; line-height: 1; padding: 6px 14px; }
     #pad-status {
       position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
       pointer-events: none; font-size: 13px; color: #888; text-align: center;
@@ -90,8 +91,10 @@
     dialog::backdrop { background: rgba(0, 0, 0, 0.6); }
     dialog form { display: grid; gap: 10px; }
     dialog h2 { margin: 0; font-size: 16px; color: #eee; }
+    dialog label { display: flex; align-items: center; gap: 8px; font-size: 15px; }
+    dialog input[type="checkbox"] { width: 20px; height: 20px; margin: 0; }
     /* 16px font: iOS zooms the page into smaller inputs on focus */
-    dialog input {
+    dialog input[type="text"], dialog input[type="password"] {
       width: 100%; padding: 8px; font-size: 16px; color: #eee; background: #111;
       border: 1px solid #444; border-radius: 6px; user-select: text; -webkit-user-select: text;
     }
@@ -125,8 +128,21 @@
     <div id="pad-score">Score: <span id="pad-score-value">0</span></div>
     <div id="pad-status"></div>
     <button id="pad-back" type="button">← Back</button>
-    <button id="pad-restart" type="button">↻ Restart</button>
+    <button id="pad-menu-open" type="button" aria-label="Controller settings">⚙</button>
   </div>
+
+  <dialog id="pad-menu">
+    <form method="dialog">
+      <h2>Controller</h2>
+      <!-- the garland may be wired upside down, and left / right swap when you play from outside the window -->
+      <label><input type="checkbox" id="reverse-vertical"> Reverse up / down</label>
+      <label><input type="checkbox" id="reverse-horizontal"> Reverse left / right</label>
+      <button type="button" id="pad-restart">↻ Restart game</button>
+      <div class="dialog-buttons">
+        <button type="submit">Close</button>
+      </div>
+    </form>
+  </dialog>
 
   <dialog id="login">
     <form id="login-form">
@@ -148,6 +164,7 @@
     const TOPIC_STATE = 'snake/state';   // <- {"score":3}, retained
     const TOPIC_STATUS = 'snake/status'; // <- "online" / "offline", retained
     const CREDENTIALS_KEY = 'snake.mqtt.credentials';
+    const SETTINGS_KEY = 'snake.controller.settings';
 
     // --- game: the same rules as firmware/snake-esp32/game.cpp ---
     const SCREEN_WIDTH = 10;
@@ -477,15 +494,53 @@
     document.getElementById('pad-open').addEventListener('click', openLogin);
     document.getElementById('pad-back').addEventListener('click', () => location.hash = '');
 
-    // restart: the browser game here, the garland game on the controller
+    // restart of the browser game; the garland game restarts from the controller menu
     document.getElementById('restart').addEventListener('click', () => {
       game = newGame();
       draw(game);
       document.getElementById('score-value').textContent = 0;
     });
+
+    // --- controller menu: direction reverse for the garland (kept in this browser) and restart ---
+    const padMenu = document.getElementById('pad-menu');
+    const reverseVertical = document.getElementById('reverse-vertical');
+    const reverseHorizontal = document.getElementById('reverse-horizontal');
+
+    try {
+      const settings = JSON.parse(localStorage.getItem(SETTINGS_KEY)) ?? {};
+      reverseVertical.checked = Boolean(settings.reverseVertical);
+      reverseHorizontal.checked = Boolean(settings.reverseHorizontal);
+    } catch {
+      // nothing saved or storage blocked: no reverse
+    }
+
+    function saveSettings() {
+      try {
+        localStorage.setItem(SETTINGS_KEY, JSON.stringify({
+          reverseVertical: reverseVertical.checked,
+          reverseHorizontal: reverseHorizontal.checked
+        }));
+      } catch {
+        // storage blocked (private mode): the settings live until the page is closed
+      }
+    }
+    reverseVertical.addEventListener('change', saveSettings);
+    reverseHorizontal.addEventListener('change', saveSettings);
+
+    const OPPOSITE = { up: 'down', down: 'up', left: 'right', right: 'left' };
+
+    // the direction as the garland sees it
+    function toGarland(direction) {
+      const vertical = direction === 'up' || direction === 'down';
+      const reversed = vertical ? reverseVertical.checked : reverseHorizontal.checked;
+      return reversed ? OPPOSITE[direction] : direction;
+    }
+
+    document.getElementById('pad-menu-open').addEventListener('click', () => padMenu.showModal());
     document.getElementById('pad-restart').addEventListener('click', () => {
       publish({ type: 'restart' });
       document.getElementById('pad-score-value').textContent = 0;
+      padMenu.close();
     });
     window.addEventListener('hashchange', showView);
 
@@ -510,7 +565,7 @@
 
     // --- input: arrows under the field and controller sectors (touch), keyboard (desktop) ---
     function sendDirection(direction) {
-      if (sessionActive) publish({ type: 'direction', value: direction });
+      if (sessionActive) publish({ type: 'direction', value: toGarland(direction) });
       else changeDirection(game, direction);
     }
 
@@ -527,7 +582,7 @@
 
     const KEYS = { ArrowUp: 'up', ArrowDown: 'down', ArrowLeft: 'left', ArrowRight: 'right' };
     document.addEventListener('keydown', (event) => {
-      if (loginDialog.open || !KEYS[event.key]) return;
+      if (loginDialog.open || padMenu.open || !KEYS[event.key]) return;
       event.preventDefault();
       sendDirection(KEYS[event.key]);
     });
