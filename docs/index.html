@@ -1,0 +1,541 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+  <title>Snake</title>
+  <!-- MQTT over WebSocket client, needed only for the controller; the browser game works without it -->
+  <script src="https://unpkg.com/mqtt@5.10.1/dist/mqtt.min.js"></script>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    [hidden] { display: none !important; }
+
+    body {
+      background: #111; color: #ccc; font-family: sans-serif; margin: 0;
+      min-height: 100vh; min-height: 100dvh; padding: 12px 16px;
+      display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px;
+      user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;
+    }
+    button { font: 14px sans-serif; color: #ccc; background: #222; border: 1px solid #444; border-radius: 6px; padding: 6px 12px; }
+
+    .toolbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 8px 16px; }
+    #status { font-size: 13px; color: #f88; text-align: center; }
+
+    .play { display: flex; flex-direction: column; align-items: center; gap: 12px; width: 100%; }
+    /* the field keeps 10:15 and fits both a phone width and the space left for the arrows */
+    #screen {
+      display: block; height: auto; image-rendering: pixelated; border: 1px solid #444;
+      width: min(100%, calc(55vh * 10 / 15)); width: min(100%, calc(55dvh * 10 / 15));
+    }
+    /* landscape phones are short: arrows go next to the field, the field takes the height left after the toolbar */
+    @media (orientation: landscape) {
+      .play { flex-direction: row; justify-content: center; gap: 24px; }
+      #screen { width: calc((100vh - 90px) * 10 / 15); width: calc((100dvh - 90px) * 10 / 15); }
+    }
+
+    /* arrows under the field, keyboard-style: up on top, left / down / right below */
+    .dpad {
+      display: grid; gap: 8px; touch-action: manipulation;
+      grid-template-columns: repeat(3, 72px); grid-template-rows: 56px 56px;
+      grid-template-areas: ". up ." "left down right";
+    }
+    .dpad button { font-size: 24px; padding: 0; }
+    .dpad [data-direction="up"] { grid-area: up; }
+    .dpad [data-direction="down"] { grid-area: down; }
+    .dpad [data-direction="left"] { grid-area: left; }
+    .dpad [data-direction="right"] { grid-area: right; }
+    .dpad button.pressed, .pad-btn.pressed { background: #2d4a2d; color: #cfc; }
+
+    /* controller view: full-screen overlay that steers the snake on the garland */
+    #pad {
+      position: fixed; inset: 0; z-index: 1;
+      display: grid; gap: 4px; padding: 4px; background: #111;
+      touch-action: none;
+      /* portrait: rows 30 / 40 / 30, the middle row split in half */
+      grid-template-rows: 3fr 4fr 3fr;
+      grid-template-columns: 1fr 1fr;
+      grid-template-areas: "up up" "left right" "down down";
+    }
+    /* landscape: the same layout turned with the phone (counter-clockwise), so every sector points where it sits */
+    @media (orientation: landscape) {
+      #pad {
+        grid-template-rows: 1fr 1fr;
+        grid-template-columns: 3fr 4fr 3fr;
+        grid-template-areas: "left up right" "left down right";
+      }
+    }
+    .pad-btn {
+      display: grid; place-items: center; border-radius: 12px;
+      background: #1b1b1b; color: #555; font-size: 12vmin;
+      transition: background 80ms, color 80ms;
+    }
+    #pad [data-direction="up"] { grid-area: up; }
+    #pad [data-direction="down"] { grid-area: down; }
+    #pad [data-direction="left"] { grid-area: left; }
+    #pad [data-direction="right"] { grid-area: right; }
+    /* mirrors #pad-back: same offset and text line (padding = button border + padding) */
+    #pad-score { position: absolute; top: 12px; right: 12px; padding: 7px 13px; pointer-events: none; font-size: 14px; }
+    #pad-back { position: absolute; top: 12px; left: 12px; }
+    #pad-restart { position: absolute; top: 12px; left: 50%; transform: translateX(-50%); }
+    #pad-status {
+      position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+      pointer-events: none; font-size: 13px; color: #888; text-align: center;
+    }
+
+    dialog {
+      background: #1b1b1b; color: #ccc; border: 1px solid #444; border-radius: 10px;
+      padding: 16px; width: min(320px, calc(100vw - 32px));
+    }
+    dialog::backdrop { background: rgba(0, 0, 0, 0.6); }
+    dialog form { display: grid; gap: 10px; }
+    dialog h2 { margin: 0; font-size: 16px; color: #eee; }
+    /* 16px font: iOS zooms the page into smaller inputs on focus */
+    dialog input {
+      width: 100%; padding: 8px; font-size: 16px; color: #eee; background: #111;
+      border: 1px solid #444; border-radius: 6px; user-select: text; -webkit-user-select: text;
+    }
+    #login-error { color: #f88; font-size: 13px; min-height: 1em; margin: 0; }
+    .dialog-buttons { display: flex; justify-content: flex-end; gap: 8px; }
+  </style>
+</head>
+<body>
+  <div class="toolbar">
+    <button id="pad-open" type="button">🎮 Controller</button>
+    <button id="restart" type="button">↻ Restart</button>
+    <div>Score: <span id="score-value">0</span></div>
+  </div>
+  <div id="status" hidden></div>
+
+  <div class="play">
+    <canvas id="screen"></canvas>
+    <div class="dpad">
+      <button type="button" data-direction="up">▲</button>
+      <button type="button" data-direction="left">◀</button>
+      <button type="button" data-direction="down">▼</button>
+      <button type="button" data-direction="right">▶</button>
+    </div>
+  </div>
+
+  <div id="pad" hidden>
+    <div class="pad-btn" data-direction="up">▲</div>
+    <div class="pad-btn" data-direction="left">◀</div>
+    <div class="pad-btn" data-direction="right">▶</div>
+    <div class="pad-btn" data-direction="down">▼</div>
+    <div id="pad-score">Score: <span id="pad-score-value">0</span></div>
+    <div id="pad-status"></div>
+    <button id="pad-back" type="button">← Back</button>
+    <button id="pad-restart" type="button">↻ Restart</button>
+  </div>
+
+  <dialog id="login">
+    <form id="login-form">
+      <h2>Connect to the garland</h2>
+      <input type="text" id="login-username" placeholder="MQTT username" autocomplete="username" required>
+      <input type="password" id="login-password" placeholder="MQTT password" autocomplete="current-password" required>
+      <p id="login-error"></p>
+      <div class="dialog-buttons">
+        <button type="button" id="login-cancel">Cancel</button>
+        <button type="submit" id="login-connect">Connect</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script>
+    // --- broker: the address isn't a secret, the login is typed in and kept in this browser only ---
+    const MQTT_URL = 'wss://bf1232a2.ala.eu-central-1.emqxsl.com:8084/mqtt';
+    const TOPIC_INPUT = 'snake/input';   // -> {"type":"start" | "stop" | "restart"}, {"type":"direction","value":"up"}
+    const TOPIC_STATE = 'snake/state';   // <- {"score":3}, retained
+    const TOPIC_STATUS = 'snake/status'; // <- "online" / "offline", retained
+    const CREDENTIALS_KEY = 'snake.mqtt.credentials';
+
+    // --- game: the same rules as firmware/snake-esp32/game.cpp ---
+    const SCREEN_WIDTH = 10;
+    const SCREEN_HEIGHT = 15;
+    const CELL_COUNT = SCREEN_WIDTH * SCREEN_HEIGHT;
+    const INIT_SPEED = 200;
+    const MAX_SPEED = 50; // shortest tick, ms
+    const SPEED_STEP = 10;
+
+    const COLORS = {
+      APPLE: 'rgb(255, 0, 0)',
+      SNAKE_BODY: 'rgb(0, 125, 0)',
+      SNAKE_EATING: 'rgb(235, 20, 200)',
+      SNAKE_HEAD: 'rgb(0, 255, 0)'
+    };
+
+    const samePosition = (a, b) => a.x === b.x && a.y === b.y;
+
+    // one step in a direction, with the screen border teleport
+    function nextHead({ x, y }, direction) {
+      if (direction === 'up') y--;
+      else if (direction === 'down') y++;
+      else if (direction === 'left') x--;
+      else x++;
+      return { x: (x + SCREEN_WIDTH) % SCREEN_WIDTH, y: (y + SCREEN_HEIGHT) % SCREEN_HEIGHT };
+    }
+
+    // never 'down': the snake starts vertical with the head on top, 'down' would bite the body at once
+    function randomStartDirection() {
+      const directions = ['up', 'left', 'right'];
+      return directions[Math.floor(Math.random() * directions.length)];
+    }
+
+    // the caller makes sure there is at least one free cell
+    function randomApple(snake) {
+      const free = [];
+      for (let y = 0; y < SCREEN_HEIGHT; y++) {
+        for (let x = 0; x < SCREEN_WIDTH; x++) {
+          if (!snake.some(segment => samePosition(segment, { x, y }))) free.push({ x, y });
+        }
+      }
+      return free[Math.floor(Math.random() * free.length)];
+    }
+
+    function newGame() {
+      const x = Math.round(SCREEN_WIDTH / 2);
+      const y = Math.round(SCREEN_HEIGHT / 2);
+      const snake = [{ x, y: y - 1 }, { x, y }, { x, y: y + 1 }];
+      return { snake, apple: randomApple(snake), direction: randomStartDirection(), speed: INIT_SPEED, eating: false, score: 0 };
+    }
+
+    function tick(game) {
+      const head = nextHead(game.snake[0], game.direction);
+      game.snake.unshift(head);
+      if (!game.eating) game.snake.pop(); // grow one tick after eating
+
+      if (samePosition(head, game.apple)) {
+        game.speed = Math.max(MAX_SPEED, game.speed - SPEED_STEP);
+        game.eating = true;
+        game.score++;
+        // the snake fills the whole screen: nowhere to put the apple, start over
+        if (game.snake.length >= CELL_COUNT) {
+          Object.assign(game, newGame());
+          return;
+        }
+        game.apple = randomApple(game.snake);
+      } else {
+        game.eating = false;
+      }
+
+      // self collision: the bitten segment and everything after it fall off
+      const bitten = game.snake.findIndex((segment, i) => i > 0 && samePosition(segment, head));
+      if (bitten > 0) game.snake.length = bitten;
+    }
+
+    // compare with the neck, not with game.direction: two quick presses within one tick can't sneak a reverse through
+    function changeDirection(game, requested) {
+      if (game.snake.length > 1 && samePosition(nextHead(game.snake[0], requested), game.snake[1])) return;
+      game.direction = requested;
+    }
+
+    // --- drawing ---
+    const CELL = 30; // size of one "LED" in canvas pixels, CSS scales it to the screen
+    const canvas = document.getElementById('screen');
+    const ctx = canvas.getContext('2d');
+    canvas.width = SCREEN_WIDTH * CELL;
+    canvas.height = SCREEN_HEIGHT * CELL;
+
+    function drawPixel(color, { x, y }) {
+      ctx.fillStyle = color;
+      ctx.fillRect(x * CELL, y * CELL, CELL, CELL);
+    }
+
+    function draw(game) {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      const [head, ...body] = game.snake;
+      body.forEach(segment => drawPixel(COLORS.SNAKE_BODY, segment));
+      drawPixel(game.eating ? COLORS.SNAKE_EATING : COLORS.SNAKE_HEAD, head);
+      drawPixel(COLORS.APPLE, game.apple);
+    }
+
+    // --- browser game: paused while the controller is open ---
+    let game = newGame();
+    let loopTimer = null;
+
+    function loop() {
+      tick(game);
+      draw(game);
+      document.getElementById('score-value').textContent = game.score;
+      loopTimer = setTimeout(loop, game.speed); // speed is re-read before every tick
+    }
+
+    function startLocalGame() {
+      if (loopTimer === null) loopTimer = setTimeout(loop, game.speed);
+    }
+
+    function stopLocalGame() {
+      clearTimeout(loopTimer);
+      loopTimer = null;
+    }
+
+    // --- garland session: exists only while the controller is open ---
+    const pad = document.getElementById('pad');
+    const padStatus = document.getElementById('pad-status');
+    const statusLine = document.getElementById('status');
+
+    let client = null;
+    let garlandStatus = 'unknown';
+
+    function publish(message, callback) {
+      if (client?.connected) client.publish(TOPIC_INPUT, JSON.stringify(message), callback);
+      else callback?.();
+    }
+
+    function updatePadStatus() {
+      if (!client?.connected) padStatus.textContent = 'Reconnecting…';
+      else if (garlandStatus !== 'online') padStatus.textContent = `Garland is ${garlandStatus}`;
+      else padStatus.textContent = '';
+    }
+
+    function showMessage(text) {
+      statusLine.textContent = text;
+      statusLine.hidden = !text;
+    }
+
+    function isAuthError(error) {
+      // MQTT 3.1.1 return codes 4 / 5, MQTT 5 reason codes 0x86 / 0x87
+      return [4, 5, 134, 135].includes(error?.code);
+    }
+
+    function describeError(error) {
+      if (isAuthError(error)) return 'Wrong username or password, or no access to the snake topics';
+      if (error?.message === 'timeout') return 'The broker does not answer, check the internet connection';
+      return error?.message || 'Connection failed';
+    }
+
+    function connectBroker(username, password) {
+      return new Promise((resolve, reject) => {
+        const candidate = mqtt.connect(MQTT_URL, {
+          username,
+          password,
+          clientId: 'snake-web-' + Math.random().toString(16).slice(2, 10),
+          reconnectPeriod: 2000,
+          connectTimeout: 8000,
+          keepalive: 20,
+          // the page closed without "Back" (tab killed, phone lost network): the broker stops the game for us
+          will: { topic: TOPIC_INPUT, payload: JSON.stringify({ type: 'stop' }), qos: 0, retain: false }
+        });
+
+        const fail = (error) => {
+          clearTimeout(timer);
+          candidate.end(true);
+          reject(error);
+        };
+        // a wrong address may never produce an error, mqtt.js just keeps reconnecting
+        const timer = setTimeout(() => fail(new Error('timeout')), 10000);
+
+        candidate.once('error', fail);
+        candidate.once('connect', () => {
+          clearTimeout(timer);
+          candidate.off('error', fail);
+          resolve(candidate);
+        });
+      });
+    }
+
+    function attachSessionHandlers(connected) {
+      connected.subscribe([TOPIC_STATE, TOPIC_STATUS]);
+
+      connected.on('message', (topic, payload) => {
+        if (topic === TOPIC_STATE) {
+          try {
+            document.getElementById('pad-score-value').textContent = JSON.parse(payload.toString()).score ?? 0;
+          } catch {
+            // ignore a broken state message
+          }
+        } else if (topic === TOPIC_STATUS) {
+          garlandStatus = payload.toString();
+          updatePadStatus();
+        }
+      });
+
+      // after a network blip: "start" resumes the game, or starts a new one if the last will already stopped it
+      connected.on('connect', () => {
+        publish({ type: 'start' });
+        updatePadStatus();
+      });
+      connected.on('reconnect', updatePadStatus);
+      connected.on('close', updatePadStatus);
+      connected.on('error', (error) => {
+        // e.g. the password was changed meanwhile: stop retrying with it
+        if (isAuthError(error)) {
+          showMessage(describeError(error));
+          location.hash = '';
+        }
+      });
+    }
+
+    function startSession() {
+      stopLocalGame();
+      document.getElementById('pad-score-value').textContent = 0;
+      publish({ type: 'start' });
+      updatePadStatus();
+    }
+
+    function endSession() {
+      if (!client) return;
+      const closing = client;
+      client = null;
+      garlandStatus = 'unknown';
+      // "stop" first, then a clean disconnect (a clean disconnect doesn't fire the last will)
+      closing.publish(TOPIC_INPUT, JSON.stringify({ type: 'stop' }), () => closing.end());
+      if (!closing.connected) closing.end(true);
+    }
+
+    // --- login dialog: shown on every "Controller", prefilled from this browser's storage ---
+    const loginDialog = document.getElementById('login');
+    const loginForm = document.getElementById('login-form');
+    const loginUsername = document.getElementById('login-username');
+    const loginPassword = document.getElementById('login-password');
+    const loginError = document.getElementById('login-error');
+    const loginConnect = document.getElementById('login-connect');
+
+    function loadCredentials() {
+      try {
+        return JSON.parse(localStorage.getItem(CREDENTIALS_KEY));
+      } catch {
+        return null;
+      }
+    }
+
+    function saveCredentials(credentials) {
+      try {
+        localStorage.setItem(CREDENTIALS_KEY, JSON.stringify(credentials));
+      } catch {
+        // storage blocked (private mode): the login just won't be prefilled next time
+      }
+    }
+
+    function openLogin() {
+      const saved = loadCredentials();
+      loginUsername.value = saved?.username ?? '';
+      loginPassword.value = saved?.password ?? '';
+      loginError.textContent = '';
+      showMessage('');
+      if (!loginDialog.open) loginDialog.showModal();
+    }
+
+    // closed without connecting (Cancel, Esc): stay on the browser game
+    loginDialog.addEventListener('close', () => {
+      if (!client && location.hash === '#pad') location.hash = '';
+    });
+    document.getElementById('login-cancel').addEventListener('click', () => loginDialog.close());
+
+    loginForm.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      if (typeof mqtt === 'undefined') {
+        loginError.textContent = 'The MQTT library did not load, check the internet connection';
+        return;
+      }
+
+      const username = loginUsername.value.trim();
+      const password = loginPassword.value;
+      loginConnect.disabled = true;
+      loginError.textContent = 'Connecting…';
+
+      try {
+        client = await connectBroker(username, password);
+        saveCredentials({ username, password });
+        attachSessionHandlers(client);
+        loginDialog.close();
+        if (location.hash === '#pad') showView(); // reload on #pad: the view is already there
+        else location.hash = 'pad';
+      } catch (error) {
+        loginError.textContent = describeError(error);
+      } finally {
+        loginConnect.disabled = false;
+      }
+    });
+
+    // --- views: the mode lives in the URL (#pad) ---
+    let sessionActive = false;
+
+    function showView() {
+      const padMode = location.hash === '#pad';
+
+      // a reload on #pad: ask for the login first, the view opens after connecting
+      if (padMode && !client) {
+        pad.hidden = true;
+        openLogin();
+        return;
+      }
+
+      pad.hidden = !padMode;
+      keepScreenOn(padMode);
+
+      if (padMode && !sessionActive) {
+        sessionActive = true;
+        startSession();
+      } else if (!padMode && sessionActive) {
+        sessionActive = false;
+        endSession();
+        startLocalGame();
+      }
+    }
+
+    document.getElementById('pad-open').addEventListener('click', openLogin);
+    document.getElementById('pad-back').addEventListener('click', () => location.hash = '');
+
+    // restart: the browser game here, the garland game on the controller
+    document.getElementById('restart').addEventListener('click', () => {
+      game = newGame();
+      draw(game);
+      document.getElementById('score-value').textContent = 0;
+    });
+    document.getElementById('pad-restart').addEventListener('click', () => {
+      publish({ type: 'restart' });
+      document.getElementById('pad-score-value').textContent = 0;
+    });
+    window.addEventListener('hashchange', showView);
+
+    // keep the phone screen on while the controller is open
+    let wakeLock = null;
+    async function keepScreenOn(on) {
+      try {
+        if (on && !wakeLock) {
+          wakeLock = await navigator.wakeLock?.request('screen') ?? null;
+          wakeLock?.addEventListener('release', () => wakeLock = null);
+        } else if (!on) {
+          await wakeLock?.release();
+        }
+      } catch {
+        // not supported or not allowed
+      }
+    }
+    // the browser drops the wake lock when the tab is hidden, take it again on return
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible' && !pad.hidden) keepScreenOn(true);
+    });
+
+    // --- input: arrows under the field and controller sectors (touch), keyboard (desktop) ---
+    function sendDirection(direction) {
+      if (sessionActive) publish({ type: 'direction', value: direction });
+      else changeDirection(game, direction);
+    }
+
+    for (const button of document.querySelectorAll('[data-direction]')) {
+      // pointerdown, not click: click fires only after the finger is lifted and lags on phones
+      button.addEventListener('pointerdown', (event) => {
+        event.preventDefault();
+        sendDirection(button.dataset.direction);
+        button.classList.add('pressed');
+        setTimeout(() => button.classList.remove('pressed'), 120);
+        navigator.vibrate?.(10); // not supported on iPhone
+      });
+    }
+
+    const KEYS = { ArrowUp: 'up', ArrowDown: 'down', ArrowLeft: 'left', ArrowRight: 'right' };
+    document.addEventListener('keydown', (event) => {
+      if (loginDialog.open || !KEYS[event.key]) return;
+      event.preventDefault();
+      sendDirection(KEYS[event.key]);
+    });
+
+    // --- start ---
+    draw(game);
+    startLocalGame();
+    showView();
+  </script>
+</body>
+</html>
